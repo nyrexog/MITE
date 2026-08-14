@@ -11,45 +11,70 @@ class MiteError(Exception):
 VARS = {}
 COMMANDS = {}
 SLASH_COMMANDS = {}
+
 TOKEN = None
 PREFIX = '"!"'
 ACTIVITY = None
 
 
+TYPES = {
+    "INTEGER",
+    "ALPHA",
+    "BOOLEAN",
+    "USER",
+    "CHANNEL",
+    "ROLE",
+}
+
+
 def parts(s):
-    out, cur, quote = [], "", False
+    out = []
+    cur = ""
+    quote = False
+
     for c in s:
         if c == '"':
             quote = not quote
             cur += c
+
         elif c == ";" and not quote:
             if cur.strip():
                 out.append(cur.strip())
             cur = ""
+
         else:
             cur += c
+
     if cur.strip():
         out.append(cur.strip())
+
     return out
 
 
 def expr(s):
     s = s.strip().rstrip(";").strip()
 
-    m = re.fullmatch(r'import\.env\("([^"]+)"\)', s)
+    m = re.fullmatch(
+        r'import\.env\("([^"]+)"\)',
+        s
+    )
+
     if m:
         return f'os.getenv({m.group(1)!r})'
 
     if s in VARS:
         return VARS[s]
 
-    if re.fullmatch(r'-?\d+', s):
+    if re.fullmatch(r"-?\d+", s):
         return s
 
     if s.startswith('"') and s.endswith('"'):
         return s
 
-    bits = re.findall(r'"(?:\\.|[^"\\])*"|[A-Za-z_]\w*', s)
+    bits = re.findall(
+        r'"(?:\\.|[^"\\])*"|[A-Za-z_]\w*',
+        s
+    )
 
     if not bits:
         return '""'
@@ -66,6 +91,7 @@ def block(lines, start):
     i = start
 
     while i < len(lines):
+
         line = lines[i].strip()
 
         if "{" in line:
@@ -83,8 +109,106 @@ def block(lines, start):
     raise MiteError("missing }")
 
 
+def parse_type(line):
+    m = re.fullmatch(
+        r'\{([A-Za-z_]\w*)\}\s*=\s*([A-Z]+)\s*;?',
+        line
+    )
+
+    if not m:
+        return None
+
+    name = m.group(1)
+    type_name = m.group(2)
+
+    if type_name not in TYPES:
+        raise MiteError(
+            f"unknown type: {type_name}"
+        )
+
+    return name, type_name
+
+
+def validation_code(name, type_name):
+    code = []
+
+    if type_name == "INTEGER":
+
+        code += [
+            f"    try:",
+            f"        {name} = int({name})",
+            "    except (ValueError, TypeError):",
+            f"        await send_reply("
+            f"'The ' + str({name}) + "
+            f"' is not a number')",
+            "        return",
+        ]
+
+    elif type_name == "ALPHA":
+
+        code += [
+            f"    if not str({name}).isalpha():",
+            f"        await send_reply("
+            f"'The ' + str({name}) + "
+            f"' contains invalid characters')",
+            "        return",
+        ]
+
+    elif type_name == "BOOLEAN":
+
+        code += [
+            f"    if str({name}).lower() not in "
+            "('true', 'false'):",
+            f"        await send_reply("
+            f"'The ' + str({name}) + "
+            f"' is not a boolean')",
+            "        return",
+            f"    {name} = "
+            f"str({name}).lower() == 'true'",
+        ]
+
+    elif type_name == "USER":
+
+        code += [
+            f"    {name} = resolve_member("
+            f"message.guild, {name})",
+            f"    if {name} is None:",
+            f"        await send_reply("
+            f"'User not found.')",
+            "        return",
+        ]
+
+    elif type_name == "CHANNEL":
+
+        code += [
+            f"    {name} = resolve_channel("
+            f"message.guild, {name})",
+            f"    if {name} is None:",
+            f"        await send_reply("
+            f"'Channel not found.')",
+            "        return",
+        ]
+
+    elif type_name == "ROLE":
+
+        code += [
+            f"    {name} = resolve_role("
+            f"message.guild, {name})",
+            f"    if {name} is None:",
+            f"        await send_reply("
+            f"'Role not found.')",
+            "        return",
+        ]
+
+    return code
+
+
 def embed(lines, start):
-    body, end = block(lines, start + 1)
+
+    body, end = block(
+        lines,
+        start + 1
+    )
 
     data = {
         "title": "None",
@@ -100,7 +224,9 @@ def embed(lines, start):
         )
 
         if m:
-            data["title"] = expr(m.group(1))
+            data["title"] = expr(
+                m.group(1)
+            )
             continue
 
         m = re.fullmatch(
@@ -109,7 +235,9 @@ def embed(lines, start):
         )
 
         if m:
-            data["description"] = expr(m.group(1))
+            data["description"] = expr(
+                m.group(1)
+            )
             continue
 
         m = re.fullmatch(
@@ -118,9 +246,13 @@ def embed(lines, start):
         )
 
         if m:
-            a = parts(m.group(1))
+
+            a = parts(
+                m.group(1)
+            )
 
             if len(a) >= 2:
+
                 data["fields"].append(
                     (
                         expr(a[0]),
@@ -143,29 +275,48 @@ def emit_embed(data, target):
         "    e = discord.Embed(",
         f"        title={data['title']},",
         f"        description={data['description']}",
-        "    )"
+        "    )",
     ]
 
     for n, v in data["fields"]:
+
         out.append(
-            f"    e.add_field(name={n}, value={v}, inline=False)"
+            f"    e.add_field("
+            f"name={n}, "
+            f"value={v}, "
+            f"inline=False)"
         )
 
     if target == "interaction":
+
         out.append(
             "    await send_embed(e)"
         )
+
     else:
+
         out.append(
-            "    await message.channel.send(embed=e)"
+            "    await message.channel.send("
+            "embed=e)"
         )
 
     return out
 
 
-def compile_body(body, target):
+def compile_body(body, target, validations=None):
+
+    if validations is None:
+        validations = []
 
     out = []
+
+    for name, type_name in validations:
+
+        out += validation_code(
+            name,
+            type_name
+        )
+
     i = 0
 
     while i < len(body):
@@ -173,24 +324,27 @@ def compile_body(body, target):
         line = body[i].strip()
 
         if not line:
+
             i += 1
             continue
 
-        # self.reply(...)
+        # Reply
         m = re.fullmatch(
             r'(?:self\.)?reply\((.*)\)\s*;?',
             line
         )
 
         if m:
+
             out.append(
-                f"    await send_reply({expr(m.group(1))})"
+                f"    await send_reply("
+                f"{expr(m.group(1))})"
             )
 
             i += 1
             continue
 
-        # self.reply.embed / self.embed
+        # Embed
         if line in (
             "self.reply.embed {",
             "self.embed {"
@@ -209,15 +363,17 @@ def compile_body(body, target):
             i = end + 1
             continue
 
-        # else.self.reply(...)
+        # Else reply
         m = re.fullmatch(
             r'else\.self\.reply\((.*)\)\s*;?',
             line
         )
 
         if m:
+
             out.append(
-                f"    await send_reply({expr(m.group(1))})"
+                f"    await send_reply("
+                f"{expr(m.group(1))})"
             )
 
             i += 1
@@ -236,6 +392,7 @@ def compile_body(body, target):
             )
 
             if len(a) >= 2:
+
                 out.append(
                     f"    await set_activity("
                     f"{expr(a[0])}, "
@@ -245,19 +402,21 @@ def compile_body(body, target):
             i += 1
             continue
 
-        # Ban / Kick
+        # Ban
         m = re.fullmatch(
-            r'self\.(ban|kick)\((.*)\)\s*;?',
+            r'self\.ban\((.*)\)\s*;?',
             line
         )
 
         if m:
 
-            action, value = m.groups()
+            value = expr(
+                m.group(1)
+            )
 
             out += [
                 f"    target = resolve_member("
-                f"message.guild, {expr(value)})",
+                f"message.guild, {value})",
 
                 "    if target is None:",
 
@@ -268,7 +427,46 @@ def compile_body(body, target):
 
                 "    try:",
 
-                f"        await target.{action}("
+                "        await target.ban("
+                "reason='Mite command')",
+
+                "    except discord.Forbidden:",
+
+                "        await send_reply("
+                "'NOT ENOUGH PERMS')",
+
+                "        return",
+            ]
+
+            i += 1
+            continue
+
+        # Kick
+        m = re.fullmatch(
+            r'self\.kick\((.*)\)\s*;?',
+            line
+        )
+
+        if m:
+
+            value = expr(
+                m.group(1)
+            )
+
+            out += [
+                f"    target = resolve_member("
+                f"message.guild, {value})",
+
+                "    if target is None:",
+
+                "        await send_reply("
+                "'User not found.')",
+
+                "        return",
+
+                "    try:",
+
+                "        await target.kick("
                 "reason='Mite command')",
 
                 "    except discord.Forbidden:",
@@ -283,12 +481,10 @@ def compile_body(body, target):
             continue
 
         # Delete current channel
-        m = re.fullmatch(
+        if re.fullmatch(
             r'self\.delete_channel\(\)\s*;?',
             line
-        )
-
-        if m:
+        ):
 
             out += [
                 "    try:",
@@ -307,7 +503,7 @@ def compile_body(body, target):
             i += 1
             continue
 
-        # Delete channels
+        # Delete multiple channels
         m = re.fullmatch(
             r'self\.delete_channels\((.*)\)\s*;?',
             line
@@ -315,8 +511,12 @@ def compile_body(body, target):
 
         if m:
 
+            amount = expr(
+                m.group(1)
+            )
+
             out += [
-                f"    amount = int({expr(m.group(1))})",
+                f"    amount = int({amount})",
 
                 "    if amount <= 0:",
 
@@ -385,7 +585,7 @@ def parse(filename):
             i += 1
             continue
 
-        # Variables
+        # Variable
         m = re.fullmatch(
             r'([A-Za-z_]\w*)\s*=\s*(.+)',
             line
@@ -452,7 +652,7 @@ def parse(filename):
             i += 1
             continue
 
-        # Commands
+        # Command
         m = re.fullmatch(
             r'self\.(command|slash)'
             r'\("([^"]+)"'
@@ -470,28 +670,51 @@ def parse(filename):
             if raw:
 
                 args = [
-                    x.strip().strip("{} ")
+                    x.strip()
+                    .strip("{} ")
                     for x in raw.split(",")
                 ]
 
-            b, end = block(
+            body, end = block(
                 lines,
                 i + 1
             )
 
+            validations = []
+
+            cleaned_body = []
+
+            for bline in body:
+
+                parsed = parse_type(
+                    bline
+                )
+
+                if parsed:
+
+                    validations.append(
+                        parsed
+                    )
+
+                else:
+
+                    cleaned_body.append(
+                        bline
+                    )
+
+            item = (
+                args,
+                validations,
+                cleaned_body
+            )
+
             if kind == "command":
 
-                COMMANDS[name] = (
-                    args,
-                    b
-                )
+                COMMANDS[name] = item
 
             else:
 
-                SLASH_COMMANDS[name] = (
-                    args,
-                    b
-                )
+                SLASH_COMMANDS[name] = item
 
             i = end + 1
             continue
@@ -511,6 +734,7 @@ def parse(filename):
         )
 
     if TOKEN is None:
+
         raise MiteError(
             "self.token(...) is required"
         )
@@ -559,23 +783,23 @@ def generate():
 
         "        'Watching': discord.Activity("
         "type=discord.ActivityType.watching,"
-        " name=text),",
+        "name=text),",
 
         "        'Listening': discord.Activity("
         "type=discord.ActivityType.listening,"
-        " name=text),",
+        "name=text),",
 
         "        'Competing': discord.Activity("
         "type=discord.ActivityType.competing,"
-        " name=text),",
+        "name=text),",
 
         "    }",
 
+        "    activity = kinds.get("
+        "kind, discord.Game(name=text))",
+
         "    await client.change_presence("
-        "activity=kinds.get("
-        "kind,"
-        "discord.Game(name=text)"
-        "))",
+        "activity=activity)",
 
         "",
 
@@ -592,13 +816,40 @@ def generate():
         "        return None",
 
         "",
+
+        "def resolve_channel(guild, value):",
+
+        "    s = str(value).strip('<#>')",
+
+        "    try:",
+
+        "        return guild.get_channel(int(s))",
+
+        "    except Exception:",
+
+        "        return None",
+
+        "",
+
+        "def resolve_role(guild, value):",
+
+        "    s = str(value).strip('<@&>')",
+
+        "    try:",
+
+        "        return guild.get_role(int(s))",
+
+        "    except Exception:",
+
+        "        return None",
+
+        "",
     ]
 
     # Prefix commands
-    for name, (
-        args,
-        body
-    ) in COMMANDS.items():
+    for name, item in COMMANDS.items():
+
+        args, validations, body = item
 
         fn = re.sub(
             r'\W+',
@@ -617,10 +868,10 @@ def generate():
             "text)",
         ]
 
-        for n, a in enumerate(args):
+        for n, arg in enumerate(args):
 
             py.append(
-                f"    {a} = "
+                f"    {arg} = "
                 f"values[{n}] "
                 f"if len(values) > {n} "
                 f"else ''"
@@ -628,16 +879,16 @@ def generate():
 
         py += compile_body(
             body,
-            "message"
+            "message",
+            validations
         )
 
         py += [""]
 
     # Slash commands
-    for name, (
-        args,
-        body
-    ) in SLASH_COMMANDS.items():
+    for name, item in SLASH_COMMANDS.items():
+
+        args, validations, body = item
 
         fn = re.sub(
             r'\W+',
@@ -646,8 +897,8 @@ def generate():
         )
 
         params = ", ".join(
-            f"{a}: str"
-            for a in args
+            f"{arg}: str"
+            for arg in args
         )
 
         if params:
@@ -688,9 +939,18 @@ def generate():
             "embed=e)",
         ]
 
+        # Slash values are already supplied by Discord.
+        for arg, type_name in validations:
+
+            py += validation_code(
+                arg,
+                type_name
+            )
+
         py += compile_body(
             body,
-            "interaction"
+            "interaction",
+            []
         )
 
         py += [""]
@@ -704,11 +964,11 @@ def generate():
 
     if ACTIVITY:
 
-        py += [
+        py.append(
             f"    await set_activity("
             f"{ACTIVITY[0]}, "
             f"{ACTIVITY[1]})"
-        ]
+        )
 
     py += [
 
@@ -790,8 +1050,7 @@ def main():
     if len(sys.argv) != 2:
 
         print(
-            "Usage: python3 "
-            "mite.py main.llt"
+            "Usage: python3 mite.py main.llt"
         )
 
         return 1
