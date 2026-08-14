@@ -2,9 +2,19 @@ import sys
 import os
 import re
 
+try:
+    import discord
+except ImportError:
+    discord = None
+
 
 class MiteError(Exception):
     pass
+
+
+variables = {}
+bot = None
+bot_token = None
 
 
 def parse_value(value):
@@ -21,10 +31,11 @@ def parse_value(value):
     if value == "false":
         return False
 
-    # Number
+    # Integer
     if re.fullmatch(r"-?\d+", value):
         return int(value)
 
+    # Float
     if re.fullmatch(r"-?\d+\.\d+", value):
         return float(value)
 
@@ -53,12 +64,31 @@ def parse_value(value):
 
         return [parse_value(x) for x in parts]
 
-    # Import
-    match = re.fullmatch(r'import\("([^"]+)"\s*;?\)', value)
+    # Environment variable
+    env_match = re.fullmatch(
+        r'import\.env\("([^"]+)"\s*;?\)',
+        value
+    )
 
-    if match:
-        filename = match.group(1)
-        return load_import(filename)
+    if env_match:
+        name = env_match.group(1)
+        result = os.getenv(name)
+
+        if result is None:
+            raise MiteError(
+                f"environment variable '{name}' was not found"
+            )
+
+        return result
+
+    # Import file
+    import_match = re.fullmatch(
+        r'import\("([^"]+)"\s*;?\)',
+        value
+    )
+
+    if import_match:
+        return load_import(import_match.group(1))
 
     return value
 
@@ -67,7 +97,7 @@ def load_import(filename):
     if not os.path.exists(filename):
         raise MiteError(f"file '{filename}' was not found")
 
-    variables = {}
+    imported = {}
 
     with open(filename, "r", encoding="utf-8") as file:
         for line in file:
@@ -80,29 +110,32 @@ def load_import(filename):
                 continue
 
             name, value = line.split("=", 1)
-            name = name.strip()
-            value = value.strip()
 
-            variables[name] = parse_value(value)
+            imported[name.strip()] = parse_value(value)
 
-    return variables
+    return imported
 
 
-def resolve(value, variables):
+def resolve(value):
     value = value.strip()
 
+    # Variable lookup:
     # NAME;
-    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*;", value)
+    match = re.fullmatch(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*;",
+        value
+    )
 
     if match:
         name = match.group(1)
 
         if name not in variables:
-            raise MiteError(f"variable '{name}' was not found")
+            raise MiteError(
+                f"variable '{name}' was not found"
+            )
 
         return variables[name]
 
-    # Normal value
     return parse_value(value)
 
 
@@ -113,12 +146,15 @@ def split_arguments(text):
     brackets = 0
 
     for char in text:
+
         if char == '"':
             quoted = not quoted
 
         if not quoted:
+
             if char in "[(":
                 brackets += 1
+
             elif char in "])":
                 brackets -= 1
 
@@ -135,73 +171,236 @@ def split_arguments(text):
     return arguments
 
 
-def execute_line(line, variables):
-    line = line.strip()
+# -----------------------------
+# DISCORD
+# -----------------------------
 
-    if not line or line.startswith("#"):
-        return
+def discord_create():
+    global bot
 
-    # Variable assignment
-    assignment = re.fullmatch(
-        r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)",
+    if discord is None:
+        raise MiteError(
+            "discord.py is not installed. "
+            "Install it with: pip install discord.py"
+        )
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+
+    bot = discord.Client(intents=intents)
+
+    @bot.event
+    async def on_ready():
+        print(
+            f"Mite Discord bot logged in as "
+            f"{bot.user}"
+        )
+
+    @bot.event
+    async def on_message(message):
+
+        if message.author == bot.user:
+            return
+
+        if message.content == "!mite":
+            await message.channel.send(
+                "Hello from Mite!"
+            )
+
+
+def discord_login(token):
+    global bot
+
+    if discord is None:
+        raise MiteError(
+            "discord.py is not installed."
+        )
+
+    if bot is None:
+        discord_create()
+
+    if not token:
+        raise MiteError(
+            "Discord token is empty."
+        )
+
+    print("Starting Discord bot...")
+
+    bot.run(token)
+
+
+# -----------------------------
+# FUNCTIONS
+# -----------------------------
+
+def execute_function(line):
+
+    global bot_token
+
+    # print(...)
+    match = re.fullmatch(
+        r"print\((.*)\)",
         line
     )
 
-    if assignment:
-        name = assignment.group(1)
-        value = assignment.group(2)
-
-        variables[name] = resolve(value, variables)
-        return
-
-    # print(...)
-    match = re.fullmatch(r"print\((.*)\)", line)
-
     if match:
+
         args = split_arguments(match.group(1))
 
         values = []
 
         for arg in args:
-            arg = arg.strip()
-
-            if arg.endswith(";"):
-                values.append(resolve(arg, variables))
-            else:
-                values.append(parse_value(arg))
+            values.append(resolve(arg))
 
         print(*values)
+
+        return True
+
+    # bot.token(...)
+    match = re.fullmatch(
+        r"bot\.token\((.*)\)",
+        line
+    )
+
+    if match:
+
+        bot_token = resolve(
+            match.group(1)
+        )
+
+        return True
+
+    # bot.login()
+    match = re.fullmatch(
+        r"bot\.login\(\)",
+        line
+    )
+
+    if match:
+
+        if bot_token is None:
+            raise MiteError(
+                "bot.token(...) must be called first"
+            )
+
+        discord_login(bot_token)
+
+        return True
+
+    # bot.login(TOKEN;)
+    match = re.fullmatch(
+        r"bot\.login\((.*)\)",
+        line
+    )
+
+    if match:
+
+        token = resolve(
+            match.group(1)
+        )
+
+        discord_login(token)
+
+        return True
+
+    return False
+
+
+def execute_line(line):
+
+    line = line.strip()
+
+    if not line:
         return
 
-    raise MiteError(f"unknown statement: {line}")
+    if line.startswith("#"):
+        return
+
+    # Function
+    if execute_function(line):
+        return
+
+    # Variable assignment
+    match = re.fullmatch(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)",
+        line
+    )
+
+    if match:
+
+        name = match.group(1)
+        value = match.group(2)
+
+        result = parse_value(value)
+
+        # import(...) can return a dictionary
+        if isinstance(result, dict):
+            variables.update(result)
+
+        else:
+            variables[name] = result
+
+        return
+
+    raise MiteError(
+        f"unknown statement: {line}"
+    )
 
 
 def run_file(filename):
+
     if not os.path.exists(filename):
-        raise MiteError(f"file '{filename}' was not found")
+        raise MiteError(
+            f"file '{filename}' was not found"
+        )
 
-    variables = {}
+    with open(
+        filename,
+        "r",
+        encoding="utf-8"
+    ) as file:
 
-    with open(filename, "r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, 1):
+        for line_number, line in enumerate(
+            file,
+            1
+        ):
+
             try:
-                execute_line(line, variables)
+                execute_line(line)
+
             except MiteError as error:
+
                 raise MiteError(
                     f"{filename}:{line_number}: {error}"
                 )
 
 
 def main():
+
     if len(sys.argv) != 2:
-        print("Mite")
-        print("Usage: mite.py <file.llt>")
+
+        print(
+            "Mite Programming Language"
+        )
+
+        print(
+            "Usage: python3 mite.py <file.llt>"
+        )
+
         sys.exit(1)
 
     try:
-        run_file(sys.argv[1])
+
+        run_file(
+            sys.argv[1]
+        )
+
     except MiteError as error:
-        print(f"MiteError: {error}")
+
+        print(
+            f"MiteError: {error}"
+        )
+
         sys.exit(1)
 
 
