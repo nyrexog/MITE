@@ -1,0 +1,31 @@
+{
+    "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - PTERODACTYL.IO",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-08-14T09:17:14+02:00",
+    "name": "Mite",
+    "author": "admin@nethost.space",
+    "description": "Mite programming language runtime for .llt files.",
+    "features": [],
+    "docker_images": {
+        "ghcr.io\/parkervcp\/yolks:python_3.12": "ghcr.io\/parkervcp\/yolks:python_3.12"
+    },
+    "file_denylist": [],
+    "startup": "cd \/home\/container && mkdir -p runtime && pip install -U discord.py && curl -L \"https:\/\/raw.githubusercontent.com\/nyrexog\/MITE\/main\/mite.py\" -o runtime\/mite.py && echo \"=== MITE DOWNLOADED ===\" && wc -c runtime\/mite.py && echo \"=== STARTING COMPILER ===\" && python3 -u runtime\/mite.py main.llt",
+    "config": {
+        "files": "{}",
+        "startup": "{\r\n    \"done\": \"change this part\"\r\n}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": null,
+            "container": "alpine:3.4",
+            "entrypoint": "ash"
+        }
+    },
+    "variables": []
+}
