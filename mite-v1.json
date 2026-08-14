@@ -6,7 +6,7 @@
     },
     "exported_at": "2026-08-14T09:17:14+02:00",
     "name": "Mite",
-    "author": "admin@nethost.space",
+    "author": "support@nethost.space",
     "description": "Mite programming language runtime for .llt files.",
     "features": [],
     "docker_images": {
