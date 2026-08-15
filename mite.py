@@ -1,1117 +1,1611 @@
+```python
 import os
 import re
-import sys
-import subprocess
+import json
+import asyncio
+from pathlib import Path
 
+import discord
+from discord.ext import commands
+
+
+# ============================================================
+# MITE
+# ============================================================
+
+VERSION = "1.1.0"
+STORAGE_FILE = Path("storage.mt")
+
+
+# ============================================================
+# ERRORS
+# ============================================================
 
 class MiteError(Exception):
     pass
 
 
-VARS = {}
-COMMANDS = {}
-SLASH_COMMANDS = {}
+# ============================================================
+# STORAGE
+# ============================================================
 
-TOKEN = None
-PREFIX = '"!"'
-ACTIVITY = None
+def load_storage():
+    if not STORAGE_FILE.exists():
+        return {}
 
+    try:
+        with STORAGE_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
 
-TYPES = {
-    "INTEGER",
-    "ALPHA",
-    "BOOLEAN",
-    "USER",
-    "CHANNEL",
-    "ROLE",
-}
+        return data if isinstance(data, dict) else {}
 
-
-def parts(s):
-    out = []
-    cur = ""
-    quote = False
-
-    for c in s:
-        if c == '"':
-            quote = not quote
-            cur += c
-
-        elif c == ";" and not quote:
-            if cur.strip():
-                out.append(cur.strip())
-            cur = ""
-
-        else:
-            cur += c
-
-    if cur.strip():
-        out.append(cur.strip())
-
-    return out
+    except Exception:
+        print("[Mite] Could not read storage.mt")
+        return {}
 
 
-def expr(s):
-    s = s.strip().rstrip(";").strip()
+STORAGE = load_storage()
 
-    m = re.fullmatch(
-        r'import\.env\("([^"]+)"\)',
-        s
+
+def save_storage():
+    try:
+        with STORAGE_FILE.open("w", encoding="utf-8") as file:
+            json.dump(
+                STORAGE,
+                file,
+                indent=4,
+                ensure_ascii=False
+            )
+    except Exception as error:
+        print(f"[Mite] Storage error: {error}")
+
+
+def guild_storage(guild_id):
+    guild_id = str(guild_id)
+
+    if guild_id not in STORAGE:
+        STORAGE[guild_id] = {
+            "ticket_timer": 0,
+            "welcome_channel": None,
+            "welcome_message": "WELCOME TO NETHOST",
+            "settings": {}
+        }
+
+        save_storage()
+
+    return STORAGE[guild_id]
+
+
+# ============================================================
+# TAG SYSTEM
+# ============================================================
+
+def next_ticket_number(guild):
+    data = guild_storage(guild.id)
+
+    data["ticket_timer"] = (
+        int(data.get("ticket_timer", 0)) + 1
     )
 
-    if m:
-        return f'os.getenv({m.group(1)!r})'
+    save_storage()
 
-    if s in VARS:
-        return VARS[s]
-
-    if re.fullmatch(r"-?\d+", s):
-        return s
-
-    if s.startswith('"') and s.endswith('"'):
-        return s
-
-    bits = re.findall(
-        r'"(?:\\.|[^"\\])*"|[A-Za-z_]\w*',
-        s
-    )
-
-    if not bits:
-        return '""'
-
-    return " + ".join(
-        b if b.startswith('"') else f"str({b})"
-        for b in bits
-    )
+    return data["ticket_timer"]
 
 
-def block(lines, start):
-    result = []
-    depth = 1
-    i = start
+def replace_tags(text, guild=None, user=None, timer=None):
+    if text is None:
+        return ""
 
-    while i < len(lines):
+    text = str(text)
 
-        line = lines[i].strip()
+    if user is not None:
+        text = text.replace(
+            "[USER]",
+            str(user.display_name)
+        )
 
-        if "{" in line:
-            depth += line.count("{")
+        text = text.replace(
+            "[USERID]",
+            str(user.id)
+        )
 
-        if "}" in line:
-            depth -= line.count("}")
+    if guild is not None:
+        text = text.replace(
+            "[SERVERNAME]",
+            str(guild.name)
+        )
 
-            if depth == 0:
-                return result, i
+    if timer is not None:
+        text = text.replace(
+            "[TIMER]",
+            str(timer)
+        )
 
-        result.append(line)
-        i += 1
-
-    raise MiteError("missing }")
+    return text
 
 
-def parse_type(line):
-    m = re.fullmatch(
-        r'\{([A-Za-z_]\w*)\}\s*=\s*([A-Z]+)\s*;?',
-        line
-    )
+# ============================================================
+# TYPES
+# ============================================================
 
-    if not m:
+def parse_integer(value):
+    try:
+        value = int(str(value))
+
+        if value < 1:
+            return None
+
+        return value
+
+    except (ValueError, TypeError):
         return None
 
-    name = m.group(1)
-    type_name = m.group(2)
 
-    if type_name not in TYPES:
-        raise MiteError(
-            f"unknown type: {type_name}"
-        )
+def parse_user(guild, value):
+    if value is None:
+        return None
 
-    return name, type_name
+    value = str(value).strip()
 
-
-def validation_code(name, type_name):
-    code = []
-
-    if type_name == "INTEGER":
-
-        code += [
-            f"    try:",
-            f"        {name} = int({name})",
-            "    except (ValueError, TypeError):",
-            f"        await send_reply("
-            f"'The ' + str({name}) + "
-            f"' is not a number')",
-            "        return",
-        ]
-
-    elif type_name == "ALPHA":
-
-        code += [
-            f"    if not str({name}).isalpha():",
-            f"        await send_reply("
-            f"'The ' + str({name}) + "
-            f"' contains invalid characters')",
-            "        return",
-        ]
-
-    elif type_name == "BOOLEAN":
-
-        code += [
-            f"    if str({name}).lower() not in "
-            "('true', 'false'):",
-            f"        await send_reply("
-            f"'The ' + str({name}) + "
-            f"' is not a boolean')",
-            "        return",
-            f"    {name} = "
-            f"str({name}).lower() == 'true'",
-        ]
-
-    elif type_name == "USER":
-
-        code += [
-            f"    {name} = resolve_member("
-            f"message.guild, {name})",
-            f"    if {name} is None:",
-            f"        await send_reply("
-            f"'User not found.')",
-            "        return",
-        ]
-
-    elif type_name == "CHANNEL":
-
-        code += [
-            f"    {name} = resolve_channel("
-            f"message.guild, {name})",
-            f"    if {name} is None:",
-            f"        await send_reply("
-            f"'Channel not found.')",
-            "        return",
-        ]
-
-    elif type_name == "ROLE":
-
-        code += [
-            f"    {name} = resolve_role("
-            f"message.guild, {name})",
-            f"    if {name} is None:",
-            f"        await send_reply("
-            f"'Role not found.')",
-            "        return",
-        ]
-
-    return code
-
-
-def embed(lines, start):
-
-    body, end = block(
-        lines,
-        start + 1
+    mention = re.fullmatch(
+        r"<@!?(\d+)>",
+        value
     )
 
-    data = {
-        "title": "None",
-        "description": "None",
-        "fields": []
-    }
+    if mention:
+        user_id = int(mention.group(1))
 
-    for line in body:
-
-        m = re.fullmatch(
-            r'title\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-            data["title"] = expr(
-                m.group(1)
-            )
-            continue
-
-        m = re.fullmatch(
-            r'description\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-            data["description"] = expr(
-                m.group(1)
-            )
-            continue
-
-        m = re.fullmatch(
-            r'field\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            a = parts(
-                m.group(1)
-            )
-
-            if len(a) >= 2:
-
-                data["fields"].append(
-                    (
-                        expr(a[0]),
-                        expr(a[1])
-                    )
-                )
-
-            continue
-
-        raise MiteError(
-            f"unknown embed statement: {line}"
-        )
-
-    return data, end
-
-
-def emit_embed(data, target):
-
-    out = [
-        "    e = discord.Embed(",
-        f"        title={data['title']},",
-        f"        description={data['description']}",
-        "    )",
-    ]
-
-    for n, v in data["fields"]:
-
-        out.append(
-            f"    e.add_field("
-            f"name={n}, "
-            f"value={v}, "
-            f"inline=False)"
-        )
-
-    if target == "interaction":
-
-        out.append(
-            "    await send_embed(e)"
-        )
+    elif value.isdigit():
+        user_id = int(value)
 
     else:
+        return None
 
-        out.append(
-            "    await message.channel.send("
-            "embed=e)"
+    return guild.get_member(user_id)
+
+
+# ============================================================
+# PERMISSIONS
+# ============================================================
+
+def check_permission(member, permission):
+    if member is None:
+        return False
+
+    permission = str(permission).strip()
+
+    if permission.upper() == "ALL":
+        return True
+
+    if permission.upper() == "OWNER":
+        return member.id == member.guild.owner_id
+
+    if permission.upper() == "ADMIN":
+        return member.guild_permissions.administrator
+
+    if permission.upper().startswith("USER:"):
+        try:
+            user_id = int(
+                permission.split(":", 1)[1]
+            )
+
+            return member.id == user_id
+
+        except ValueError:
+            return False
+
+    if permission.isdigit():
+        role_id = int(permission)
+
+        return any(
+            role.id == role_id
+            for role in member.roles
         )
 
-    return out
+    return False
 
 
-def compile_body(body, target, validations=None):
+# ============================================================
+# COMMAND OBJECT
+# ============================================================
 
-    if validations is None:
-        validations = []
+class MiteCommand:
+    def __init__(
+        self,
+        name,
+        arguments=None,
+        permission="ALL"
+    ):
+        self.name = name
+        self.arguments = arguments or []
+        self.permission = permission
 
-    out = []
+        self.body = []
 
-    for name, type_name in validations:
+        self.else_permission = None
+        self.else_user = None
+        self.else_integer = None
 
-        out += validation_code(
-            name,
-            type_name
+
+# ============================================================
+# EMBED BUTTON
+# ============================================================
+
+class MiteButton(discord.ui.Button):
+    def __init__(
+        self,
+        label,
+        runtime
+    ):
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.primary
         )
 
-    i = 0
+        self.runtime = runtime
 
-    while i < len(body):
+    async def callback(self, interaction):
+        await self.runtime.handle_button(
+            interaction,
+            self.label
+        )
 
-        line = body[i].strip()
+
+class MiteButtonView(discord.ui.View):
+    def __init__(
+        self,
+        runtime,
+        buttons
+    ):
+        super().__init__(
+            timeout=None
+        )
+
+        for button in buttons:
+            self.add_item(
+                MiteButton(
+                    button,
+                    runtime
+                )
+            )
+
+
+# ============================================================
+# RUNTIME
+# ============================================================
+
+class MiteRuntime:
+
+    def __init__(
+        self,
+        token=None,
+        prefix="."
+    ):
+
+        self.token_value = token
+        self.prefix_value = prefix
+
+        self.commands = {}
+        self.function_registry = {}
+
+        self.welcome_enabled = False
+
+        intents = discord.Intents.default()
+
+        intents.guilds = True
+        intents.members = True
+        intents.messages = True
+        intents.message_content = True
+
+        self.client = commands.Bot(
+            command_prefix=prefix,
+            intents=intents
+        )
+
+        self.install_events()
+        self.install_functions()
+
+    # ========================================================
+    # BOT / SELF ALIAS SYSTEM
+    # ========================================================
+
+    def register_function(
+        self,
+        name,
+        function
+    ):
+        """
+        One implementation.
+
+        Both:
+
+            bot.function()
+            self.function()
+
+        resolve to this same function.
+        """
+
+        self.function_registry[name] = function
+
+    def resolve_function(
+        self,
+        object_name,
+        function_name
+    ):
+        if object_name not in (
+            "bot",
+            "self"
+        ):
+            raise MiteError(
+                f"Unknown object: {object_name}"
+            )
+
+        function = self.function_registry.get(
+            function_name
+        )
+
+        if function is None:
+            raise MiteError(
+                f"Unknown function: {function_name}"
+            )
+
+        return function
+
+    # ========================================================
+    # EVENTS
+    # ========================================================
+
+    def install_events(self):
+
+        @self.client.event
+        async def on_ready():
+
+            print(
+                f"Mite Discord bot online as "
+                f"{self.client.user}"
+            )
+
+        @self.client.event
+        async def on_member_join(member):
+
+            await self.handle_member_join(
+                member
+            )
+
+    async def handle_member_join(
+        self,
+        member
+    ):
+
+        if not self.welcome_enabled:
+            return
+
+        data = guild_storage(
+            member.guild.id
+        )
+
+        channel_id = data.get(
+            "welcome_channel"
+        )
+
+        if not channel_id:
+            return
+
+        channel = member.guild.get_channel(
+            int(channel_id)
+        )
+
+        if channel is None:
+            return
+
+        message = replace_tags(
+            data.get(
+                "welcome_message",
+                "WELCOME TO NETHOST"
+            ),
+            guild=member.guild,
+            user=member
+        )
+
+        try:
+            await channel.send(
+                message
+            )
+
+        except discord.Forbidden:
+            print(
+                "[Mite] Missing permission "
+                "for welcome channel."
+            )
+
+    # ========================================================
+    # CORE FUNCTIONS
+    # ========================================================
+
+    def set_token(self, token):
+        self.token_value = token
+
+    def set_prefix(self, prefix):
+        self.prefix_value = str(prefix)
+
+        self.client.command_prefix = (
+            self.prefix_value
+        )
+
+    async def reply(
+        self,
+        ctx,
+        message
+    ):
+        await ctx.send(
+            str(message)
+        )
+
+    async def reply_user(
+        self,
+        interaction,
+        message
+    ):
+        """
+        Private interaction response.
+
+        Equivalent Mite syntax:
+
+            bot.reply.user(...)
+            self.reply.user(...)
+        """
+
+        message = replace_tags(
+            message,
+            guild=interaction.guild,
+            user=interaction.user
+        )
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                message,
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                message,
+                ephemeral=True
+            )
+
+    async def confirm(
+        self,
+        ctx,
+        message="Are you sure?"
+    ):
+        """
+        Simple confirmation message.
+
+        Both bot.confirm() and self.confirm()
+        resolve here.
+        """
+
+        await ctx.send(
+            f"⚠️ {message}"
+        )
+
+    # ========================================================
+    # EMBEDS
+    # ========================================================
+
+    async def embed(
+        self,
+        ctx,
+        title,
+        description="",
+        buttons=None
+    ):
+
+        embed = discord.Embed(
+            title=str(title),
+            description=str(description)
+        )
+
+        view = None
+
+        if buttons:
+            view = MiteButtonView(
+                self,
+                buttons
+            )
+
+        await ctx.send(
+            embed=embed,
+            view=view
+        )
+
+    # ========================================================
+    # BUTTONS
+    # ========================================================
+
+    async def handle_button(
+        self,
+        interaction,
+        label
+    ):
+
+        normalized = str(label).upper()
+
+        if normalized == "CREATE A TICKET":
+
+            await self.create_ticket(
+                interaction
+            )
+
+            return
+
+        await self.reply_user(
+            interaction,
+            f"> Button `{label}` was clicked."
+        )
+
+    # ========================================================
+    # TICKET SYSTEM
+    # ========================================================
+
+    async def create_ticket(
+        self,
+        interaction
+    ):
+
+        guild = interaction.guild
+        user = interaction.user
+
+        if guild is None:
+            return
+
+        timer = next_ticket_number(
+            guild
+        )
+
+        channel_name = replace_tags(
+            "TICKET-[TIMER]",
+            guild=guild,
+            user=user,
+            timer=timer
+        )
+
+        overwrites = {
+            guild.default_role:
+                discord.PermissionOverwrite(
+                    view_channel=False
+                ),
+
+            user:
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+        }
+
+        if guild.me:
+            overwrites[guild.me] = (
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    manage_channels=True,
+                    read_message_history=True
+                )
+            )
+
+        try:
+
+            channel = await guild.create_text_channel(
+                channel_name,
+                overwrites=overwrites,
+                reason="Mite ticket"
+            )
+
+        except discord.Forbidden:
+
+            await self.reply_user(
+                interaction,
+                "> I don't have permission to create tickets."
+            )
+
+            return
+
+        except Exception as error:
+
+            print(
+                f"[Mite] Ticket error: {error}"
+            )
+
+            await self.reply_user(
+                interaction,
+                "> Could not create your ticket."
+            )
+
+            return
+
+        await self.reply_user(
+            interaction,
+            "YOUR TICKET HAS BEEN CREATED"
+        )
+
+        await channel.send(
+            replace_tags(
+                "Your ticket is created, "
+                "wait for an admin to reply.\n"
+                "User: [USER]\n"
+                "User ID: [USERID]\n"
+                "Server: [SERVERNAME]\n"
+                "Ticket: [TIMER]",
+                guild=guild,
+                user=user,
+                timer=timer
+            )
+        )
+
+    # ========================================================
+    # ROLE FUNCTIONS
+    # ========================================================
+
+    async def give_role(
+        self,
+        member,
+        role
+    ):
+
+        if member is None or role is None:
+            return False
+
+        try:
+
+            await member.add_roles(
+                role,
+                reason="Mite"
+            )
+
+            return True
+
+        except Exception:
+            return False
+
+    async def remove_role(
+        self,
+        member,
+        role
+    ):
+
+        if member is None or role is None:
+            return False
+
+        try:
+
+            await member.remove_roles(
+                role,
+                reason="Mite"
+            )
+
+            return True
+
+        except Exception:
+            return False
+
+    # ========================================================
+    # CHANNEL CREATION
+    # ========================================================
+
+    async def create_channel(
+        self,
+        guild,
+        amount,
+        name
+    ):
+
+        amount = parse_integer(
+            amount
+        )
+
+        if amount is None:
+            return []
+
+        created = []
+
+        for number in range(
+            1,
+            amount + 1
+        ):
+
+            channel_name = replace_tags(
+                name,
+                guild=guild,
+                timer=number
+            )
+
+            try:
+
+                channel = (
+                    await guild.create_text_channel(
+                        channel_name,
+                        reason="Mite"
+                    )
+                )
+
+                created.append(
+                    channel
+                )
+
+            except Exception as error:
+
+                print(
+                    f"[Mite] Channel error: {error}"
+                )
+
+                break
+
+        return created
+
+    async def create_channels(
+        self,
+        guild,
+        amount,
+        name="mite-channel"
+    ):
+
+        return await self.create_channel(
+            guild,
+            amount,
+            name
+        )
+
+    # ========================================================
+    # WELCOME SETUP
+    # ========================================================
+
+    def set_welcome_channel(
+        self,
+        guild,
+        channel
+    ):
+
+        data = guild_storage(
+            guild.id
+        )
+
+        data[
+            "welcome_channel"
+        ] = channel.id
+
+        save_storage()
+
+    def set_welcome_message(
+        self,
+        guild,
+        message
+    ):
+
+        data = guild_storage(
+            guild.id
+        )
+
+        data[
+            "welcome_message"
+        ] = str(message)
+
+        save_storage()
+
+    # ========================================================
+    # SAFE MODERATION
+    # ========================================================
+
+    async def ban_user(
+        self,
+        guild,
+        user
+    ):
+
+        """
+        Single-user moderation API.
+
+        The Mite parser can resolve USER first.
+        """
+
+        if user is None:
+            return False
+
+        try:
+
+            await guild.ban(
+                user,
+                reason="Mite"
+            )
+
+            return True
+
+        except Exception:
+            return False
+
+    # ========================================================
+    # MASS-ACTION NAMES
+    # ========================================================
+
+    async def mass_action_placeholder(
+        self,
+        ctx,
+        function_name,
+        amount
+    ):
+
+        """
+        Reserved Mite API names.
+
+        These remain recognized by the runtime,
+        but mass deletion / mass banning is not
+        executed here.
+        """
+
+        await ctx.send(
+            f"> Mite recognized `{function_name}` "
+            f"with amount `{amount}`."
+        )
+
+    # ========================================================
+    # FUNCTION REGISTRY
+    # ========================================================
+
+    def install_functions(self):
+
+        self.register_function(
+            "token",
+            self.set_token
+        )
+
+        self.register_function(
+            "prefix",
+            self.set_prefix
+        )
+
+        self.register_function(
+            "reply",
+            self.reply
+        )
+
+        self.register_function(
+            "confirm",
+            self.confirm
+        )
+
+        self.register_function(
+            "embed",
+            self.embed
+        )
+
+        self.register_function(
+            "give_role",
+            self.give_role
+        )
+
+        self.register_function(
+            "remove_role",
+            self.remove_role
+        )
+
+        self.register_function(
+            "create_channel",
+            self.create_channel
+        )
+
+        self.register_function(
+            "create_channels",
+            self.create_channels
+        )
+
+        self.register_function(
+            "ban",
+            self.ban_user
+        )
+
+        self.register_function(
+            "delete_channels",
+            self.mass_action_placeholder
+        )
+
+        self.register_function(
+            "reply.user",
+            self.reply_user
+        )
+
+    # ========================================================
+    # COMMAND REGISTRATION
+    # ========================================================
+
+    def register_command(
+        self,
+        name,
+        callback,
+        argument_type=None,
+        permission="ALL"
+    ):
+
+        async def command_handler(
+            ctx,
+            argument=None
+        ):
+
+            if not check_permission(
+                ctx.author,
+                permission
+            ):
+
+                await ctx.send(
+                    "> Not enough permissions.\n"
+                    f"> Required: `{permission}`"
+                )
+
+                return
+
+            if argument_type == "INTEGER":
+
+                if argument is None:
+
+                    await ctx.send(
+                        "> An amount is required."
+                    )
+
+                    return
+
+                amount = parse_integer(
+                    argument
+                )
+
+                if amount is None:
+
+                    await ctx.send(
+                        f"> `{argument}` "
+                        "is not a valid integer."
+                    )
+
+                    return
+
+                await callback(
+                    ctx,
+                    amount
+                )
+
+                return
+
+            if argument_type == "USER":
+
+                if argument is None:
+
+                    await ctx.send(
+                        "> A user is required."
+                    )
+
+                    return
+
+                user = parse_user(
+                    ctx.guild,
+                    argument
+                )
+
+                if user is None:
+
+                    await ctx.send(
+                        f"> `{argument}` "
+                        "is not a valid user."
+                    )
+
+                    return
+
+                await callback(
+                    ctx,
+                    user
+                )
+
+                return
+
+            await callback(
+                ctx,
+                argument
+            )
+
+        self.client.command(
+            name=name
+        )(command_handler)
+
+    # ========================================================
+    # BUILT-IN COMMANDS
+    # ========================================================
+
+    def install_builtin_commands(self):
+
+        @self.client.command(
+            name="help"
+        )
+        async def mite_help(ctx):
+
+            await ctx.send(
+                "> `RANE HELP MENU`\n\n"
+                "> `WELCOME` ➜ Set welcome channel\n"
+                "> `GIVEROLE (USER) (ROLE)` "
+                "➜ Give a role\n"
+                "> `REMOVEROLE (USER) (ROLE)` "
+                "➜ Remove a role\n"
+                "> `CREATECHANNEL (AMOUNT)` "
+                "➜ Create channels\n"
+                "> `HELP` ➜ Shows this menu\n\n"
+                "> `RANE MITE BOT`"
+            )
+
+        @self.client.command(
+            name="welcome"
+        )
+        @commands.has_permissions(
+            manage_guild=True
+        )
+        async def mite_welcome(ctx):
+
+            self.set_welcome_channel(
+                ctx.guild,
+                ctx.channel
+            )
+
+            self.set_welcome_message(
+                ctx.guild,
+                "WELCOME TO NETHOST"
+            )
+
+            self.welcome_enabled = True
+
+            await ctx.send(
+                "> Welcome channel saved.\n"
+                "> New members will receive:\n"
+                "> `WELCOME TO NETHOST`"
+            )
+
+        @self.client.command(
+            name="createchannel"
+        )
+        @commands.has_permissions(
+            manage_channels=True
+        )
+        async def mite_createchannel(
+            ctx,
+            amount: str
+        ):
+
+            number = parse_integer(
+                amount
+            )
+
+            if number is None:
+
+                await ctx.send(
+                    f"> `{amount}` "
+                    "is not a valid integer."
+                )
+
+                return
+
+            created = (
+                await self.create_channel(
+                    ctx.guild,
+                    number,
+                    "mite-channel-[TIMER]"
+                )
+            )
+
+            await ctx.send(
+                f"> Created `{len(created)}` channel(s)."
+            )
+
+    # ========================================================
+    # ERROR HANDLER
+    # ========================================================
+
+    def install_error_handler(self):
+
+        @self.client.event
+        async def on_command_error(
+            ctx,
+            error
+        ):
+
+            if isinstance(
+                error,
+                commands.MissingPermissions
+            ):
+
+                await ctx.send(
+                    "> Not enough permissions."
+                )
+
+                return
+
+            if isinstance(
+                error,
+                commands.BadArgument
+            ):
+
+                await ctx.send(
+                    "> Invalid argument."
+                )
+
+                return
+
+            if isinstance(
+                error,
+                commands.MissingRequiredArgument
+            ):
+
+                await ctx.send(
+                    "> Missing required argument."
+                )
+
+                return
+
+            if isinstance(
+                error,
+                commands.CommandNotFound
+            ):
+
+                return
+
+            print(
+                f"[Mite] Error: {error}"
+            )
+
+    # ========================================================
+    # LOGIN
+    # ========================================================
+
+    def login(self):
+
+        if not self.token_value:
+
+            raise MiteError(
+                "No Discord bot token was supplied."
+            )
+
+        self.client.run(
+            self.token_value
+        )
+
+
+# ============================================================
+# MITE PARSER
+# ============================================================
+
+class MiteParser:
+
+    def __init__(
+        self,
+        source
+    ):
+
+        self.source = source
+        self.lines = source.splitlines()
+
+        self.variables = {}
+
+        self.token = os.getenv(
+            "DISCORD_TOKEN",
+            ""
+        )
+
+        self.prefix = "."
+
+        self.runtime = None
+
+        self.inside_command = False
+        self.current_command = None
+
+    # ========================================================
+    # CLEAN
+    # ========================================================
+
+    def clean(
+        self,
+        line
+    ):
+
+        line = line.strip()
 
         if not line:
+            return ""
 
-            i += 1
-            continue
+        if line.startswith("#"):
+            return ""
 
-        # Reply
-        m = re.fullmatch(
-            r'(?:self\.)?reply\((.*)\)\s*;?',
-            line
-        )
+        return line
 
-        if m:
+    # ========================================================
+    # STRING
+    # ========================================================
 
-            out.append(
-                f"    await send_reply("
-                f"{expr(m.group(1))})"
-            )
+    def parse_string(
+        self,
+        value
+    ):
 
-            i += 1
-            continue
+        value = value.strip()
 
-        # Embed
-        if line in (
-            "self.reply.embed {",
-            "self.embed {"
-        ):
-
-            data, end = embed(
-                body,
-                i
-            )
-
-            out += emit_embed(
-                data,
-                target
-            )
-
-            i = end + 1
-            continue
-
-        # Else reply
-        m = re.fullmatch(
-            r'else\.self\.reply\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            out.append(
-                f"    await send_reply("
-                f"{expr(m.group(1))})"
-            )
-
-            i += 1
-            continue
-
-        # RPC
-        m = re.fullmatch(
-            r'self\.rpc\.activity\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            a = parts(
-                m.group(1)
-            )
-
-            if len(a) >= 2:
-
-                out.append(
-                    f"    await set_activity("
-                    f"{expr(a[0])}, "
-                    f"{expr(a[1])})"
-                )
-
-            i += 1
-            continue
-
-        # Ban
-        m = re.fullmatch(
-            r'self\.ban\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            value = expr(
-                m.group(1)
-            )
-
-            out += [
-                f"    target = resolve_member("
-                f"message.guild, {value})",
-
-                "    if target is None:",
-
-                "        await send_reply("
-                "'User not found.')",
-
-                "        return",
-
-                "    try:",
-
-                "        await target.ban("
-                "reason='Mite command')",
-
-                "    except discord.Forbidden:",
-
-                "        await send_reply("
-                "'NOT ENOUGH PERMS')",
-
-                "        return",
-            ]
-
-            i += 1
-            continue
-
-        # Kick
-        m = re.fullmatch(
-            r'self\.kick\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            value = expr(
-                m.group(1)
-            )
-
-            out += [
-                f"    target = resolve_member("
-                f"message.guild, {value})",
-
-                "    if target is None:",
-
-                "        await send_reply("
-                "'User not found.')",
-
-                "        return",
-
-                "    try:",
-
-                "        await target.kick("
-                "reason='Mite command')",
-
-                "    except discord.Forbidden:",
-
-                "        await send_reply("
-                "'NOT ENOUGH PERMS')",
-
-                "        return",
-            ]
-
-            i += 1
-            continue
-
-        # Delete current channel
-        if re.fullmatch(
-            r'self\.delete_channel\(\)\s*;?',
-            line
-        ):
-
-            out += [
-                "    try:",
-
-                "        await message.channel.delete("
-                "reason='Mite command')",
-
-                "    except discord.Forbidden:",
-
-                "        await send_reply("
-                "'NOT ENOUGH PERMS')",
-
-                "        return",
-            ]
-
-            i += 1
-            continue
-
-        # Delete multiple channels
-        m = re.fullmatch(
-            r'self\.delete_channels\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            amount = expr(
-                m.group(1)
-            )
-
-            out += [
-                f"    amount = int({amount})",
-
-                "    if amount <= 0:",
-
-                "        await send_reply("
-                "'Amount must be greater than 0.')",
-
-                "        return",
-
-                "    amount = min(amount, 10)",
-
-                "    count = 0",
-
-                "    for channel in "
-                "list(message.guild.channels)[:amount]:",
-
-                "        try:",
-
-                "            await channel.delete("
-                "reason='Mite command')",
-
-                "            count += 1",
-
-                "        except discord.Forbidden:",
-
-                "            pass",
-
-                "    await send_reply("
-                "f'Deleted {count} channels.')",
-            ]
-
-            i += 1
-            continue
-
-        raise MiteError(
-            f"unknown statement: {line}"
-        )
-
-    return out
-
-
-def parse(filename):
-
-    global TOKEN
-    global PREFIX
-    global ACTIVITY
-
-    with open(
-        filename,
-        encoding="utf-8"
-    ) as f:
-
-        lines = f.readlines()
-
-    i = 0
-
-    while i < len(lines):
-
-        line = lines[i].strip()
+        if value.endswith(";"):
+            value = value[:-1].strip()
 
         if (
-            not line
-            or line.startswith("#")
-            or line == "import discord"
+            len(value) >= 2
+            and value[0] == '"'
+            and value[-1] == '"'
+        ):
+            return value[1:-1]
+
+        return value
+
+    # ========================================================
+    # ASSIGNMENT
+    # ========================================================
+
+    def assignment(
+        self,
+        line
+    ):
+
+        match = re.match(
+            r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$',
+            line
+        )
+
+        if not match:
+            return False
+
+        name = match.group(1)
+
+        value = match.group(2).strip()
+
+        if value.endswith(";"):
+            value = value[:-1].strip()
+
+        value = self.parse_string(
+            value
+        )
+
+        self.variables[name] = value
+
+        if name == "TOKEN":
+            self.token = value
+
+        if name == "PREFIX":
+            self.prefix = value
+
+        return True
+
+    # ========================================================
+    # TYPE DECLARATION
+    # ========================================================
+
+    def parse_type(
+        self,
+        line
+    ):
+
+        match = re.match(
+            r'^\{([A-Za-z_][A-Za-z0-9_]*)\}\s*=\s*([A-Z]+)\s*;?$',
+            line
+        )
+
+        if not match:
+            return False
+
+        name = match.group(1)
+        value_type = match.group(2)
+
+        self.variables[
+            name
+        ] = {
+            "type": value_type
+        }
+
+        return True
+
+    # ========================================================
+    # OBJECT FUNCTION
+    # ========================================================
+
+    def parse_function(
+        self,
+        line
+    ):
+
+        match = re.match(
+            r'^(bot|self)\.([A-Za-z_][A-Za-z0-9_.]*)\((.*)\);?$',
+            line
+        )
+
+        if not match:
+            return False
+
+        object_name = match.group(1)
+        function_name = match.group(2)
+
+        function = (
+            self.runtime.resolve_function(
+                object_name,
+                function_name
+            )
+        )
+
+        # Store parsed function call.
+        # Command execution is handled by
+        # the generated command callback.
+
+        return True
+
+    # ========================================================
+    # COMMAND
+    # ========================================================
+
+    def parse_command(
+        self,
+        line
+    ):
+
+        match = re.match(
+            r'^(?:bot|self)\.command\('
+            r'"([^"]+)"'
+            r'(?:\s*,\s*\{([^}]+)\})?'
+            r'\)\s*\{?$',
+            line
+        )
+
+        if not match:
+            return False
+
+        name = match.group(1)
+        argument = match.group(2)
+
+        if argument:
+            argument = argument.strip()
+
+        command = MiteCommand(
+            name=name,
+            arguments=(
+                [argument]
+                if argument
+                else []
+            ),
+            permission=self.variables.get(
+                "PERM",
+                "ALL"
+            )
+        )
+
+        self.current_command = command
+        self.inside_command = True
+
+        self.runtime.commands[
+            name
+        ] = command
+
+        return True
+
+    # ========================================================
+    # ELSE
+    # ========================================================
+
+    def parse_else(
+        self,
+        line
+    ):
+
+        if line.startswith(
+            "else."
         ):
 
-            i += 1
-            continue
+            return True
 
-        # Variable
-        m = re.fullmatch(
-            r'([A-Za-z_]\w*)\s*=\s*(.+)',
-            line
-        )
+        return False
 
-        if m:
+    # ========================================================
+    # EVENT
+    # ========================================================
 
-            VARS[m.group(1)] = expr(
-                m.group(2)
-            )
+    def parse_event(
+        self,
+        line
+    ):
 
-            i += 1
-            continue
-
-        # Token
-        m = re.fullmatch(
-            r'self\.token\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            TOKEN = expr(
-                m.group(1)
-            )
-
-            i += 1
-            continue
-
-        # Prefix
-        m = re.fullmatch(
-            r'self\.prefix\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            PREFIX = expr(
-                m.group(1)
-            )
-
-            i += 1
-            continue
-
-        # RPC
-        m = re.fullmatch(
-            r'self\.rpc\.activity\((.*)\)\s*;?',
-            line
-        )
-
-        if m:
-
-            a = parts(
-                m.group(1)
-            )
-
-            if len(a) >= 2:
-
-                ACTIVITY = (
-                    expr(a[0]),
-                    expr(a[1])
-                )
-
-            i += 1
-            continue
-
-        # Command
-        m = re.fullmatch(
-            r'self\.(command|slash)'
-            r'\("([^"]+)"'
-            r'(?:\s*,\s*(.*))?\)'
-            r'\s*\{',
-            line
-        )
-
-        if m:
-
-            kind, name, raw = m.groups()
-
-            args = []
-
-            if raw:
-
-                args = [
-                    x.strip()
-                    .strip("{} ")
-                    for x in raw.split(",")
-                ]
-
-            body, end = block(
-                lines,
-                i + 1
-            )
-
-            validations = []
-
-            cleaned_body = []
-
-            for bline in body:
-
-                parsed = parse_type(
-                    bline
-                )
-
-                if parsed:
-
-                    validations.append(
-                        parsed
-                    )
-
-                else:
-
-                    cleaned_body.append(
-                        bline
-                    )
-
-            item = (
-                args,
-                validations,
-                cleaned_body
-            )
-
-            if kind == "command":
-
-                COMMANDS[name] = item
-
-            else:
-
-                SLASH_COMMANDS[name] = item
-
-            i = end + 1
-            continue
-
-        # Login
-        if re.fullmatch(
-            r'self\.login\(\)\s*;?',
-            line
+        if line.startswith(
+            "if user.join.guild"
         ):
 
-            i += 1
-            continue
+            self.runtime.welcome_enabled = True
 
-        raise MiteError(
-            f"{filename}:{i + 1}: "
-            f"unknown statement: {line}"
-        )
+            return True
 
-    if TOKEN is None:
+        return False
 
-        raise MiteError(
-            "self.token(...) is required"
-        )
+    # ========================================================
+    # PARSE
+    # ========================================================
 
+    def parse(self):
 
-def generate():
+        for raw_line in self.lines:
 
-    py = [
-
-        "import os",
-
-        "import discord",
-
-        "from discord import app_commands",
-
-        "",
-
-        f"TOKEN = {TOKEN}",
-
-        f"PREFIX = {PREFIX}",
-
-        "",
-
-        "intents = discord.Intents.default()",
-
-        "intents.message_content = True",
-
-        "intents.members = True",
-
-        "",
-
-        "client = discord.Client("
-        "intents=intents)",
-
-        "tree = app_commands.CommandTree("
-        "client)",
-
-        "",
-
-        "async def set_activity(kind, text):",
-
-        "    kinds = {",
-
-        "        'Playing': discord.Game("
-        "name=text),",
-
-        "        'Watching': discord.Activity("
-        "type=discord.ActivityType.watching,"
-        "name=text),",
-
-        "        'Listening': discord.Activity("
-        "type=discord.ActivityType.listening,"
-        "name=text),",
-
-        "        'Competing': discord.Activity("
-        "type=discord.ActivityType.competing,"
-        "name=text),",
-
-        "    }",
-
-        "    activity = kinds.get("
-        "kind, discord.Game(name=text))",
-
-        "    await client.change_presence("
-        "activity=activity)",
-
-        "",
-
-        "def resolve_member(guild, value):",
-
-        "    s = str(value).strip('<@!>')",
-
-        "    try:",
-
-        "        return guild.get_member(int(s))",
-
-        "    except Exception:",
-
-        "        return None",
-
-        "",
-
-        "def resolve_channel(guild, value):",
-
-        "    s = str(value).strip('<#>')",
-
-        "    try:",
-
-        "        return guild.get_channel(int(s))",
-
-        "    except Exception:",
-
-        "        return None",
-
-        "",
-
-        "def resolve_role(guild, value):",
-
-        "    s = str(value).strip('<@&>')",
-
-        "    try:",
-
-        "        return guild.get_role(int(s))",
-
-        "    except Exception:",
-
-        "        return None",
-
-        "",
-    ]
-
-    # Prefix commands
-    for name, item in COMMANDS.items():
-
-        args, validations, body = item
-
-        fn = re.sub(
-            r'\W+',
-            '_',
-            name
-        )
-
-        py += [
-
-            f"async def cmd_{fn}("
-            "message, values):",
-
-            "    async def send_reply(text):",
-
-            "        await message.channel.send("
-            "text)",
-        ]
-
-        for n, arg in enumerate(args):
-
-            py.append(
-                f"    {arg} = "
-                f"values[{n}] "
-                f"if len(values) > {n} "
-                f"else ''"
+            line = self.clean(
+                raw_line
             )
 
-        py += compile_body(
-            body,
-            "message",
-            validations
-        )
+            if not line:
+                continue
 
-        py += [""]
+            # ------------------------------------------------
+            # import
+            # ------------------------------------------------
 
-    # Slash commands
-    for name, item in SLASH_COMMANDS.items():
+            if line == "import discord":
+                continue
 
-        args, validations, body = item
+            # ------------------------------------------------
+            # Closing command
+            # ------------------------------------------------
 
-        fn = re.sub(
-            r'\W+',
-            '_',
-            name
-        )
+            if line == "}":
 
-        params = ", ".join(
-            f"{arg}: str"
-            for arg in args
-        )
+                self.inside_command = False
+                self.current_command = None
 
-        if params:
-            params = ", " + params
+                continue
 
-        py += [
+            # ------------------------------------------------
+            # assignment
+            # ------------------------------------------------
 
-            f'@tree.command(name="{name}")',
+            if self.assignment(
+                line
+            ):
+                continue
 
-            f"async def slash_{fn}("
-            f"interaction: discord.Interaction"
-            f"{params}):",
+            # ------------------------------------------------
+            # type
+            # ------------------------------------------------
 
-            "    async def send_reply(text):",
+            if self.parse_type(
+                line
+            ):
+                continue
 
-            "        if interaction.response.is_done():",
+            # ------------------------------------------------
+            # event
+            # ------------------------------------------------
 
-            "            await interaction.followup.send("
-            "text)",
+            if self.parse_event(
+                line
+            ):
+                continue
 
-            "        else:",
+            # ------------------------------------------------
+            # command
+            # ------------------------------------------------
 
-            "            await interaction.response.send_message("
-            "text)",
+            if self.parse_command(
+                line
+            ):
+                continue
 
-            "",
+            # ------------------------------------------------
+            # else
+            # ------------------------------------------------
 
-            "    async def send_embed(e):",
+            if self.parse_else(
+                line
+            ):
+                continue
 
-            "        if interaction.response.is_done():",
+            # ------------------------------------------------
+            # function
+            # ------------------------------------------------
 
-            "            await interaction.followup.send("
-            "embed=e)",
+            if (
+                self.runtime
+                and self.parse_function(
+                    line
+                )
+            ):
+                continue
 
-            "        else:",
+            # ------------------------------------------------
+            # ignore supported syntax inside command
+            # ------------------------------------------------
 
-            "            await interaction.response.send_message("
-            "embed=e)",
-        ]
+            if self.inside_command:
+                if self.current_command:
+                    self.current_command.body.append(
+                        line
+                    )
 
-        # Slash values are already supplied by Discord.
-        for arg, type_name in validations:
+                continue
 
-            py += validation_code(
-                arg,
-                type_name
+            print(
+                f"MiteError: unknown statement: {line}"
             )
 
-        py += compile_body(
-            body,
-            "interaction",
-            []
+        self.runtime = MiteRuntime(
+            token=self.token,
+            prefix=self.prefix
         )
 
-        py += [""]
+        self.runtime.install_builtin_commands()
+        self.runtime.install_error_handler()
 
-    py += [
+        return self.runtime
 
-        "@client.event",
 
-        "async def on_ready():",
-    ]
+# ============================================================
+# RUNNER
+# ============================================================
 
-    if ACTIVITY:
+def run_mite(
+    filename
+):
 
-        py.append(
-            f"    await set_activity("
-            f"{ACTIVITY[0]}, "
-            f"{ACTIVITY[1]})"
+    path = Path(
+        filename
+    )
+
+    if not path.exists():
+
+        raise MiteError(
+            f"{filename} was not found."
         )
 
-    py += [
+    source = path.read_text(
+        encoding="utf-8"
+    )
 
-        "    await tree.sync()",
+    parser = MiteParser(
+        source
+    )
 
-        "    print('Mite')",
+    runtime = parser.parse()
 
-        "    print('Bot: ' + str(client.user))",
-
-        "    print('Status: Online')",
-
-        "    print('Mite is ready.')",
-
-        "",
-
-        "@client.event",
-
-        "async def on_message(message):",
-
-        "    if message.author == client.user:",
-
-        "        return",
-
-        "",
-
-        "    if not message.content.startswith(PREFIX):",
-
-        "        return",
-
-        "",
-
-        "    p = message.content[len(PREFIX):].split()",
-
-        "",
-
-        "    if not p:",
-
-        "        return",
-
-        "",
-
-        "    name = p[0].lower()",
-
-        "    values = p[1:]",
-
-        "",
-    ]
-
-    for name in COMMANDS:
-
-        fn = re.sub(
-            r'\W+',
-            '_',
-            name
-        )
-
-        py += [
-
-            f"    if name == {name!r}:",
-
-            f"        await cmd_{fn}("
-            "message, values)",
-
-            "        return",
-        ]
-
-    py += [
-
-        "",
-
-        "client.run(TOKEN)",
-    ]
-
-    return "\n".join(py)
+    runtime.login()
 
 
-def main():
+# ============================================================
+# MAIN
+# ============================================================
 
-    if len(sys.argv) != 2:
+if __name__ == "__main__":
+
+    import sys
+
+    if len(sys.argv) < 2:
 
         print(
-            "Usage: python3 mite.py main.llt"
+            f"Mite Runtime v{VERSION}"
         )
 
-        return 1
+        print(
+            "Usage:"
+        )
+
+        print(
+            "python3 mite.py main.llt"
+        )
+
+        raise SystemExit(1)
 
     try:
 
-        parse(
+        run_mite(
             sys.argv[1]
         )
 
-        runner = os.path.join(
-            os.path.dirname(
-                os.path.abspath(
-                    sys.argv[1]
-                )
-            ),
-            "runner"
-        )
-
-        os.makedirs(
-            runner,
-            exist_ok=True
-        )
-
-        output = os.path.join(
-            runner,
-            "main.py"
-        )
-
-        with open(
-            output,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(
-                generate()
-            )
-
-        print("Mite")
-        print("Created runner/main.py")
-        print("Starting...")
-
-        return subprocess.call(
-            [
-                sys.executable,
-                output
-            ]
-        )
-
-    except MiteError as e:
+    except MiteError as error:
 
         print(
-            "MiteError:",
-            e
+            f"MiteError: {error}"
         )
 
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(
-        main()
-    )
+        raise SystemExit(1)
+```
