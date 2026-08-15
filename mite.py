@@ -1,4 +1,3 @@
-```python
 import os
 import re
 import json
@@ -1608,7 +1607,7 @@ if __name__ == "__main__":
         )
 
         raise SystemExit(1)
-```
+
 # ============================================================
 # MITE EMBED EXTENSION
 # Add this AFTER your existing mite.py code
