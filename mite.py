@@ -1609,3 +1609,151 @@ if __name__ == "__main__":
 
         raise SystemExit(1)
 ```
+# ============================================================
+# MITE EMBED EXTENSION
+# Add this AFTER your existing mite.py code
+# ============================================================
+
+class MiteEmbed:
+    def __init__(self, guild=None, user=None, timer=None):
+        self.guild = guild
+        self.user = user
+        self.timer = timer
+
+        self.discord_embed = discord.Embed()
+
+    def _tags(self, value):
+        value = str(value)
+
+        if self.user is not None:
+            value = value.replace(
+                "[USER]",
+                str(self.user.display_name)
+            )
+
+            value = value.replace(
+                "[USERID]",
+                str(self.user.id)
+            )
+
+        if self.guild is not None:
+            value = value.replace(
+                "[SERVERNAME]",
+                str(self.guild.name)
+            )
+
+        if self.timer is not None:
+            value = value.replace(
+                "[TIMER]",
+                str(self.timer)
+            )
+
+        return value
+
+    def title(self, value):
+        self.discord_embed.title = self._tags(value)
+        return self
+
+    def description(self, value):
+        self.discord_embed.description = self._tags(value)
+        return self
+
+    def footer(self, value):
+        self.discord_embed.set_footer(
+            text=self._tags(value)
+        )
+        return self
+
+    def author(self, value):
+        self.discord_embed.set_author(
+            name=self._tags(value)
+        )
+        return self
+
+    def thumbnail(self, value):
+        self.discord_embed.set_thumbnail(
+            url=self._tags(value)
+        )
+        return self
+
+    def image(self, value):
+        self.discord_embed.set_image(
+            url=self._tags(value)
+        )
+        return self
+
+    def url(self, value):
+        self.discord_embed.url = self._tags(value)
+        return self
+
+    def field(
+        self,
+        name,
+        value,
+        inline=False
+    ):
+        self.discord_embed.add_field(
+            name=self._tags(name),
+            value=self._tags(value),
+            inline=inline
+        )
+        return self
+
+
+# ============================================================
+# Embed helper functions
+# ============================================================
+
+def mite_embed(
+    guild=None,
+    user=None,
+    timer=None
+):
+    return MiteEmbed(
+        guild=guild,
+        user=user,
+        timer=timer
+    )
+
+
+async def mite_reply_embed(
+    ctx,
+    embed,
+    buttons=None
+):
+    view = None
+
+    if buttons:
+        view = MiteView(
+            runtime=None,
+            buttons=buttons
+        )
+
+    await ctx.send(
+        embed=embed.discord_embed,
+        view=view
+    )
+
+
+# ============================================================
+# bot.* / self.* aliases
+# ============================================================
+
+def mite_get_embed(
+    runtime,
+    guild=None,
+    user=None,
+    timer=None
+):
+    return MiteEmbed(
+        guild=guild,
+        user=user,
+        timer=timer
+    )
+
+
+# Both names intentionally point to the
+# same embed implementation.
+
+bot_embed = mite_get_embed
+self_embed = mite_get_embed
